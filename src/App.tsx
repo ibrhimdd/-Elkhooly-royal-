@@ -5,14 +5,15 @@ import { motion, AnimatePresence } from 'motion/react';
 import ReactMarkdown from 'react-markdown';
 
 // --- Constants & Types ---
-const MODEL_NAME = "gemini-3.1-flash-live-preview"; // Use Live model for native audio streaming
+const MODEL_NAME = "gemini-3-flash-preview"; // Stable model for text/vision
+const TTS_MODEL_NAME = "gemini-2.5-flash-preview-tts"; // Dedicated TTS model
 const SYSTEM_INSTRUCTION = "أنت مرشد متحف ملكي قديم. تعرف على الأثر في الصورة واشرح أهميته التاريخية بأسلوب ملكي مهيب ومختصر جداً (أقل من 50 كلمة)، ثم اختم بسؤال تحفيزي.";
 
 interface Message {
   role: 'user' | 'assistant';
   text: string;
   image?: string;
-  audio?: string; // For history playback
+  audio?: string;
   isStreaming?: boolean;
 }
 
@@ -27,11 +28,6 @@ export default function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  
-  // Audio Streaming Refs
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const nextStartTimeRef = useRef<number>(0);
-  const audioChunksRef = useRef<Uint8Array[]>([]);
 
   // --- Camera Setup ---
   const startCamera = useCallback(async () => {
@@ -46,8 +42,10 @@ export default function App() {
       });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        setIsCameraReady(true);
-        setError(null);
+        videoRef.current.onloadedmetadata = () => {
+          setIsCameraReady(true);
+          setError(null);
+        };
       }
     } catch (err) {
       console.error("Error accessing camera:", err);
@@ -61,11 +59,17 @@ export default function App() {
       if (videoRef.current?.srcObject) {
         (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
       }
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
     };
   }, [startCamera]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (!isCameraReady && videoRef.current && videoRef.current.videoWidth > 0) {
+        setIsCameraReady(true);
+      }
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [isCameraReady]);
 
   // Scroll to top only when a NEW message starts
   useEffect(() => {
@@ -74,91 +78,22 @@ export default function App() {
     }
   }, [messages.length]);
 
-  // --- Audio Utils ---
-  const initAudioContext = () => {
-    if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      nextStartTimeRef.current = audioContextRef.current.currentTime;
-    }
-    if (audioContextRef.current.state === 'suspended') {
-      audioContextRef.current.resume();
-    }
-  };
-
-  const playPCMChunk = (base64Data: string) => {
-    if (isMuted || !audioContextRef.current) return;
-
-    const binary = atob(base64Data);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    
-    // Store for history playback
-    audioChunksRef.current.push(bytes);
-
-    const int16 = new Int16Array(bytes.buffer);
-    const floats = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) {
-      floats[i] = int16[i] / 32768.0;
-    }
-
-    const buffer = audioContextRef.current.createBuffer(1, floats.length, 24000);
-    buffer.getChannelData(0).set(floats);
-    
-    const source = audioContextRef.current.createBufferSource();
-    source.buffer = buffer;
-    source.connect(audioContextRef.current.destination);
-    
-    const startTime = Math.max(audioContextRef.current.currentTime, nextStartTimeRef.current);
-    source.start(startTime);
-    nextStartTimeRef.current = startTime + buffer.duration;
-  };
-
-  const finalizeAudio = () => {
-    if (audioChunksRef.current.length === 0) return null;
-    
-    const totalLength = audioChunksRef.current.reduce((acc, chunk) => acc + chunk.length, 0);
-    const combined = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of audioChunksRef.current) {
-      combined.set(chunk, offset);
-      offset += chunk.length;
-    }
-    
-    const audioUrl = createWavUrl(combined, 24000);
-    audioChunksRef.current = []; // Clear for next scan
-    return audioUrl;
-  };
-
-  const createWavUrl = (pcmData: Uint8Array, sampleRate: number) => {
-    const buffer = new ArrayBuffer(44 + pcmData.length);
-    const view = new DataView(buffer);
-    view.setUint32(0, 0x52494646, false);
-    view.setUint32(4, 36 + pcmData.length, true);
-    view.setUint32(8, 0x57415645, false);
-    view.setUint32(12, 0x666d7420, false);
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, 1, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);
-    view.setUint32(36, 0x64617461, false);
-    view.setUint32(40, pcmData.length, true);
-    for (let i = 0; i < pcmData.length; i++) view.setUint8(44 + i, pcmData[i]);
-    const blob = new Blob([buffer], { type: 'audio/wav' });
-    return URL.createObjectURL(blob);
-  };
-
   // --- AI Logic ---
   const processImage = async () => {
     if (!videoRef.current || !canvasRef.current || isProcessing) return;
 
+    // Ensure video has dimensions
+    if (!videoRef.current || videoRef.current.videoWidth === 0 || videoRef.current.videoHeight === 0) {
+      setError("الكاميرا ليست جاهزة بعد. يرجى الانتظار ثانية حتى يكتمل التحميل.");
+      // Force a re-check of camera readiness
+      if (videoRef.current?.videoWidth && videoRef.current?.videoHeight) {
+        setIsCameraReady(true);
+      }
+      return;
+    }
+
     setIsProcessing(true);
     setError(null);
-    initAudioContext();
-    audioChunksRef.current = [];
-    nextStartTimeRef.current = audioContextRef.current?.currentTime || 0;
     
     // Auto-switch to results view immediately
     setActiveTab('history');
@@ -184,11 +119,10 @@ export default function App() {
       if (!ctx) throw new Error("Could not get canvas context");
 
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const base64Image = canvas.toDataURL('image/jpeg', 0.6).split(',')[1];
+      const base64Image = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
       
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       
-      // Request both TEXT and AUDIO in the same stream for zero-delay sync
       const streamResponse = await ai.models.generateContentStream({
         model: MODEL_NAME,
         contents: {
@@ -196,42 +130,31 @@ export default function App() {
             { text: SYSTEM_INSTRUCTION },
             { inlineData: { data: base64Image, mimeType: 'image/jpeg' } }
           ]
-        },
-        config: {
-          responseModalities: [Modality.TEXT, Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: 'Kore' }
-            }
-          }
         }
       });
 
       let fullText = "";
+      let audioTriggered = false;
       for await (const chunk of streamResponse) {
-        const parts = (chunk as GenerateContentResponse).candidates?.[0]?.content?.parts;
-        if (parts) {
-          for (const part of parts) {
-            if (part.text) {
-              fullText += part.text;
-              setMessages(prev => {
-                const newMessages = [...prev];
-                if (newMessages[0]) {
-                  newMessages[0] = { ...newMessages[0], text: fullText };
-                }
-                return newMessages;
-              });
-            }
-            if (part.inlineData?.data) {
-              // Play audio chunk immediately as it arrives!
-              playPCMChunk(part.inlineData.data);
-            }
-          }
+        const textChunk = (chunk as GenerateContentResponse).text || "";
+        fullText += textChunk;
+        
+        // Trigger audio early (after 50 chars) to overlap with text streaming
+        if (!audioTriggered && fullText.length > 50 && !isMuted) {
+          audioTriggered = true;
+          generateAudio(fullText);
         }
+
+        setMessages(prev => {
+          const newMessages = [...prev];
+          if (newMessages[0]) {
+            newMessages[0] = { ...newMessages[0], text: fullText };
+          }
+          return newMessages;
+        });
       }
 
-      // Finalize the message state with the full audio for history
-      const finalAudioUrl = finalizeAudio();
+      // Finalize the message state
       setMessages(prev => {
         const newMessages = [...prev];
         if (newMessages[0]) {
@@ -239,16 +162,21 @@ export default function App() {
             ...newMessages[0], 
             text: fullText, 
             isStreaming: false,
-            image: `data:image/jpeg;base64,${base64Image}`,
-            audio: finalAudioUrl || undefined
+            image: `data:image/jpeg;base64,${base64Image}`
           };
         }
         return newMessages;
       });
 
+      // If text was too short to trigger early, trigger it now
+      if (!isMuted && fullText && !audioTriggered) {
+        generateAudio(fullText);
+      }
+
     } catch (err) {
       console.error("Processing Error:", err);
-      setError("حدث خطأ أثناء معالجة الصورة. يرجى المحاولة مرة أخرى.");
+      const errorMsg = err instanceof Error ? err.message : JSON.stringify(err);
+      setError(`حدث خطأ: ${errorMsg.includes('INVALID_ARGUMENT') ? 'فشل في معالجة الصورة' : 'يرجى المحاولة مرة أخرى'}`);
       setMessages(prev => prev.slice(1));
       setActiveTab('camera');
     } finally {
@@ -256,12 +184,69 @@ export default function App() {
     }
   };
 
+  const generateAudio = async (text: string) => {
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      
+      const ttsResponse = await ai.models.generateContent({
+        model: TTS_MODEL_NAME,
+        contents: [{ parts: [{ text: `تحدث بصوت ملكي مهيب ومختصر: ${text}` }] }],
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: 'Kore' },
+            },
+          },
+        },
+      });
+
+      const base64Audio = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (base64Audio) {
+        const binary = atob(base64Audio);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const audioUrl = createWavUrl(bytes, 24000);
+        
+        setMessages(prev => {
+          const newMessages = [...prev];
+          if (newMessages[0]) {
+            newMessages[0] = { ...newMessages[0], audio: audioUrl };
+          }
+          return newMessages;
+        });
+
+        const audio = new Audio(audioUrl);
+        audio.play().catch(e => console.error("Audio playback failed:", e));
+      }
+    } catch (ttsErr) {
+      console.error("TTS Error:", ttsErr);
+    }
+  };
+
+  const createWavUrl = (pcmData: Uint8Array, sampleRate: number) => {
+    const buffer = new ArrayBuffer(44 + pcmData.length);
+    const view = new DataView(buffer);
+    view.setUint32(0, 0x52494646, false);
+    view.setUint32(4, 36 + pcmData.length, true);
+    view.setUint32(8, 0x57415645, false);
+    view.setUint32(12, 0x666d7420, false);
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    view.setUint32(36, 0x64617461, false);
+    view.setUint32(40, pcmData.length, true);
+    for (let i = 0; i < pcmData.length; i++) view.setUint8(44 + i, pcmData[i]);
+    const blob = new Blob([buffer], { type: 'audio/wav' });
+    return URL.createObjectURL(blob);
+  };
+
   const resetSearch = () => {
     setActiveTab('camera');
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
   };
 
   return (
@@ -320,6 +305,7 @@ export default function App() {
               ref={videoRef} 
               autoPlay 
               playsInline 
+              onLoadedMetadata={() => setIsCameraReady(true)}
               className={`w-full h-full object-cover transition-opacity duration-1000 ${isCameraReady ? 'opacity-80' : 'opacity-0'}`}
             />
             
