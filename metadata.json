@@ -1,0 +1,5 @@
+{
+  "name": "AI Museum Guide",
+  "description": "An interactive AI-powered museum guide that identifies artifacts via camera and explains them in the persona of an Ancient Egyptian Royal Guide.",
+  "requestFramePermissions": ["camera"]
+}
